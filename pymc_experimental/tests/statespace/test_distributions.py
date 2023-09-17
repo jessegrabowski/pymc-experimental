@@ -1,3 +1,6 @@
+import re
+import sys
+
 import numpy as np
 import pymc as pm
 import pytensor
@@ -115,8 +118,7 @@ def test_loglike_vectors_agree(kfilter, pymc_model):
     assert_allclose(test_ll, np.array(scipy_lls).ravel(), atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize("output_name", ["states_latent", "states_observed"])
-def test_lgss_distribution_from_steps(output_name, ss_mod_me, pymc_model_2):
+def test_lgss_distribution_from_steps(ss_mod_me, pymc_model_2):
     with pymc_model_2:
         ss_mod_me._insert_random_variables()
         matrices = ss_mod_me.unpack_statespace()
@@ -129,11 +131,56 @@ def test_lgss_distribution_from_steps(output_name, ss_mod_me, pymc_model_2):
         delete_rvs_from_model(["states_latent", "states_observed", "states_combined"])
 
     assert idata.prior.coords["states_latent_dim_0"].shape == (101,)
-    assert not np.any(np.isnan(idata.prior[output_name].values))
+
+    for output_name in ["states_latent", "states_observed"]:
+        assert not np.any(np.isnan(idata.prior[output_name].values))
 
 
-@pytest.mark.parametrize("output_name", ["states_latent", "states_observed"])
-def test_lgss_distribution_with_dims(output_name, ss_mod_me, pymc_model_2):
+def test_lgss_distribution_specify_k_endog(ss_mod_me, pymc_model_2):
+    with pymc_model_2:
+        ss_mod_me._insert_random_variables()
+        matrices = ss_mod_me.unpack_statespace()
+
+        # pylint: disable=unpacking-non-sequence
+        latent_states_1, obs_states_1 = LinearGaussianStateSpace(
+            "states_1", *matrices, steps=100, k_endog=1
+        )
+        latent_states_2, obs_states_2 = LinearGaussianStateSpace("states_2", *matrices, steps=100)
+        # pylint: enable=unpacking-non-sequence
+
+        idata = pm.sample_prior_predictive(samples=10)
+        delete_rvs_from_model(
+            [
+                "states_1_latent",
+                "states_1_observed",
+                "states_1_combined",
+                "states_2_latent",
+                "states_2_observed",
+                "states_2_combined",
+            ]
+        )
+
+    assert idata.prior["states_1_latent"].shape == idata.prior["states_2_latent"].shape
+    assert idata.prior["states_1_observed"].shape == idata.prior["states_2_observed"].shape
+
+
+def test_lgss_raises_on_wrong_k_endog(ss_mod_me, pymc_model_2):
+    with pymc_model_2:
+        ss_mod_me._insert_random_variables()
+        matrices = ss_mod_me.unpack_statespace()
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape("Inferred k_endog does not agree with provided value (1 != 2)."),
+        ):
+            # pylint: disable=unpacking-non-sequence
+            latent_states, obs_states = LinearGaussianStateSpace(
+                "states_1", *matrices, steps=100, k_endog=2
+            )
+            # pylint: enable=unpacking-non-sequence
+
+
+def test_lgss_distribution_with_dims(ss_mod_me, pymc_model_2):
     with pymc_model_2:
         ss_mod_me._insert_random_variables()
         matrices = ss_mod_me.unpack_statespace()
@@ -153,11 +200,12 @@ def test_lgss_distribution_with_dims(output_name, ss_mod_me, pymc_model_2):
     assert all(
         [dim in idata.prior.states_observed.coords.keys() for dim in [TIME_DIM, OBS_STATE_DIM]]
     )
-    assert not np.any(np.isnan(idata.prior[output_name].values))
+
+    for output_name in ["states_latent", "states_observed"]:
+        assert not np.any(np.isnan(idata.prior[output_name].values)), output_name
 
 
-@pytest.mark.parametrize("output_name", ["states_latent", "states_observed"])
-def test_lgss_with_time_varying_inputs(output_name, rng):
+def test_lgss_with_time_varying_inputs(rng):
     X = rng.random(size=(10, 3), dtype=floatX)
     ss_mod = structural.LevelTrendComponent() + structural.RegressionComponent(
         name="exog", k_exog=3
@@ -204,4 +252,45 @@ def test_lgss_with_time_varying_inputs(output_name, rng):
     assert all(
         [dim in idata.prior.states_observed.coords.keys() for dim in [TIME_DIM, OBS_STATE_DIM]]
     )
-    assert not np.any(np.isnan(idata.prior[output_name].values))
+
+    for output_name in ["states_latent", "states_observed"]:
+        assert not np.any(np.isnan(idata.prior[output_name].values)), output_name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="JAX not supported on windows.")
+def test_lgss_with_degenerate_covariance_jax(rng):
+    # In pytensor/pymc, draws from MvN(0, 0) are 0.0, but in JAX they are nan. This test checks that the degenerate
+    # case is covered in JAX mode.
+
+    X = rng.random(size=(10, 3), dtype=floatX)
+    ss_mod = structural.LevelTrendComponent(innovations_order=0) + structural.TimeSeasonality(
+        name="seasonal", season_length=3, state_names=["A", "B", "C"], innovations=False
+    )
+    mod = ss_mod.build("data", verbose=False)
+
+    coords = {
+        ALL_STATE_DIM: ["level", "trend", "B", "C"],
+        OBS_STATE_DIM: ["data"],
+        TIME_DIM: np.arange(10, dtype="int"),
+    }
+
+    with pm.Model(coords=coords) as m:
+        exog_data = pm.MutableData("data_exog", X)
+
+        P0_diag = pm.Exponential("P0_diag", 1, shape=(mod.k_states,))
+        P0 = pm.Deterministic("P0", pt.diag(P0_diag))
+        initial_trend = pm.Normal("initial_trend", shape=(2,))
+        seasonal_coefs = pm.Normal("seasonal_coefs", shape=(2,))
+
+        mod._insert_random_variables()
+        matrices = mod.unpack_statespace()
+
+        # pylint: disable=unpacking-non-sequence
+        latent_states, obs_states = LinearGaussianStateSpace(
+            "states", *matrices, steps=9, dims=[TIME_DIM, ALL_STATE_DIM, OBS_STATE_DIM], mode="JAX"
+        )
+        # pylint: enable=unpacking-non-sequence
+        idata = pm.sample_prior_predictive(samples=10, compile_kwargs={"mode": "JAX"})
+
+    for output_name in ["states_latent", "states_observed"]:
+        assert not np.any(np.isnan(idata.prior[output_name].values)), output_name

@@ -95,8 +95,12 @@ def test_VARMAX_param_counts_match_statsmodels(data, order, var):
 
 
 @pytest.mark.parametrize("order", orders, ids=ids)
-@pytest.mark.filterwarnings("ignore::statsmodels.tools.sm_exceptions.EstimationWarning")
+@pytest.mark.filterwarnings(
+    "ignore::statsmodels.tools.sm_exceptions.EstimationWarning", "ignore::FutureWarning"
+)
 def test_VARMAX_update_matches_statsmodels(data, order, rng):
+    # This test raises a future warning because of statsmodels' use of pandas
+
     p, q = order
 
     sm_var = sm.tsa.VARMAX(data, order=(p, q))
